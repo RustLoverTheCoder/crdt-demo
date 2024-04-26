@@ -1,6 +1,7 @@
 // cargo run port 3000
 
 use std::{
+    collections::HashMap,
     sync::{Arc, Mutex},
     time::Duration,
 };
@@ -35,11 +36,14 @@ struct MyBehaviour {
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct Invite {
+    pub id: uuid::Uuid,
     pub data: Vec<u8>,
 }
 
 #[tokio::main]
 async fn main() {
+    let mut state: HashMap<uuid::Uuid, automerge::AutoCommit> = HashMap::new();
+
     // let args: Vec<String> = env::args().collect();
 
     // let port = &args[2];
@@ -63,6 +67,9 @@ async fn main() {
         );
         INSERT INTO paths VALUES (NULL, 'test', 'test', 'test');
     ";
+
+    // doc 对应的 id
+    let id: uuid::Uuid = uuid::Uuid::new_v4();
     // 记录 test 记录的 doc
     let mut doc: automerge::AutoCommit = automerge::AutoCommit::new();
     let path = Path {
@@ -71,6 +78,9 @@ async fn main() {
         description: "test".to_string(),
     };
     reconcile(&mut doc, &path).unwrap();
+
+    // 存入state
+    state.insert(id, doc.clone());
 
     let conn = db_arc.lock().unwrap();
 
@@ -112,45 +122,35 @@ async fn main() {
         .unwrap();
 
     let db_arc_copy = db_arc.clone();
+
     tokio::spawn(async move {
-        while let Some((peer, mut stream)) = incoming_streams.next().await {
-            println!("Incoming stream from: {peer}");
+        while let Some((_peer, mut stream)) = incoming_streams.next().await {
             // 读取stream数据
             let mut buf = Vec::new();
             stream.read_to_end(&mut buf).await.unwrap();
             // 解析数据
             let invite: Invite = serde_json::from_slice(&buf).unwrap();
             let data = invite.data;
-            // 将data序列化到doc
-            let other_doc = automerge::AutoCommit::load(&data).unwrap();
-            // 拿到数据
-            let path: Path = hydrate(&other_doc).unwrap();
-            println!("path: {path:#?}");
+            let id = invite.id;
 
-            // 插入数据库
-            let query = format!(
-                "INSERT INTO paths VALUES (NULL, '{}', '{}', '{}');",
-                path.name, path.path, path.description
-            );
+            // state中是否存在id
+            if state.contains_key(&id) {
+                // 存在则更新
+                // 从state中拿到doc
+                let doc = state.get_mut(&id).unwrap();
+                // 更新doc
+                let mut other_doc = automerge::AutoCommit::load(&data).unwrap();
 
-            let conn = db_arc_copy.lock().unwrap();
+                doc.merge(&mut other_doc).expect("Failed to merge doc");
 
-            conn.execute(&query).unwrap();            
-
-            // 查询数据库
-            let query = "SELECT * FROM paths";
-            let mut stmt = conn.prepare(query).unwrap();
-
-            while let State::Row = stmt.next().unwrap() {
-                let id: i64 = stmt.read(0).unwrap();
-                let name: String = stmt.read(1).unwrap();
-                let path: String = stmt.read(2).unwrap();
-                let description: String = stmt.read(3).unwrap();
-
-                println!(
-                    "id: {}, name: {}, path: {}, description: {}",
-                    id, name, path, description
-                );
+                // 更新数据库
+                update_db(db_arc_copy.clone(), doc.clone());
+            } else {
+                let other_doc = automerge::AutoCommit::load(&data).unwrap();
+                // 插入数据库
+                insert_db(db_arc_copy.clone(), other_doc.clone());
+                // 不存在则插入
+                state.insert(id, other_doc);
             }
         }
     });
@@ -168,7 +168,8 @@ async fn main() {
 
                         // 发送 doc 数据
                         let sync_request = serde_json::to_vec(&Invite {
-                             data: doc.save(),
+                            id,
+                            data: doc.save(),
                         }).expect("Failed to serialize sync request");
 
                         // open new stream
@@ -235,5 +236,65 @@ async fn main() {
                 _ => {}
             }
         }
+    }
+}
+
+pub fn insert_db(conn: Arc<Mutex<sqlite::Connection>>, doc: automerge::AutoCommit) {
+    // 将data序列化到doc
+    // 拿到数据
+    let path: Path = hydrate(&doc).unwrap();
+    // 插入数据库
+    let query = format!(
+        "INSERT INTO paths VALUES (NULL, '{}', '{}', '{}');",
+        path.name, path.path, path.description
+    );
+
+    let conn = conn.lock().unwrap();
+
+    conn.execute(&query).unwrap();
+
+    // 查询数据库
+    let query = "SELECT * FROM paths";
+    let mut stmt = conn.prepare(query).unwrap();
+
+    while let State::Row = stmt.next().unwrap() {
+        let id: i64 = stmt.read(0).unwrap();
+        let name: String = stmt.read(1).unwrap();
+        let path: String = stmt.read(2).unwrap();
+        let description: String = stmt.read(3).unwrap();
+
+        println!(
+            "id: {}, name: {}, path: {}, description: {}",
+            id, name, path, description
+        );
+    }
+}
+
+
+pub fn update_db(conn: Arc<Mutex<sqlite::Connection>>, doc: automerge::AutoCommit) {
+    // 将data序列化到doc
+    // 拿到数据
+    let path: Path = hydrate(&doc).unwrap();
+    // 更新数据库 id = 2
+    let query = format!("UPDATE paths SET name = '{}' WHERE id = 2;", path.name);
+
+    let conn = conn.lock().unwrap();
+
+    conn.execute(&query).unwrap();
+
+    // 查询数据库
+    let query = "SELECT * FROM paths";
+    let mut stmt = conn.prepare(query).unwrap();
+
+    while let State::Row = stmt.next().unwrap() {
+        let id: i64 = stmt.read(0).unwrap();
+        let name: String = stmt.read(1).unwrap();
+        let path: String = stmt.read(2).unwrap();
+        let description: String = stmt.read(3).unwrap();
+
+        println!(
+            "id: {}, name: {}, path: {}, description: {}",
+            id, name, path, description
+        );
     }
 }
